@@ -1,0 +1,10 @@
+# Dependensi & hasil build
+node_modules/
+dist/
+
+# Environment (jangan commit kredensial TURN dsb.)
+.env
+
+# Log & artefak OS/editor
+*.log
+.DS_Store

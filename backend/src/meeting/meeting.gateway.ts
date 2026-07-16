@@ -41,6 +41,28 @@ export class MeetingGateway
   // Menyimpan socket id host untuk tiap room (orang pertama yang membuat room)
   private roomHosts: Map<string, string> = new Map();
 
+  // Room yang dikunci host: peserta baru tidak bisa bergabung
+  private lockedRooms: Set<string> = new Set();
+
+  // Room dengan ruang tunggu aktif: peserta baru menunggu persetujuan host
+  private waitingRooms: Set<string> = new Set();
+
+  // Peserta yang sedang menunggu persetujuan, keyed by socket id
+  private pendingJoins: Map<string, { roomCode: string; userName: string }> =
+    new Map();
+
+  // Riwayat chat per room (maks 100 pesan) agar peserta baru ikut melihatnya
+  private roomMessages: Map<
+    string,
+    {
+      messageId: string;
+      senderId: string;
+      senderName: string;
+      text: string;
+      sentAt: number;
+    }[]
+  > = new Map();
+
   // Kode rapat dibuat case-insensitive & bebas spasi agar "ABC-123" == "abc-123 "
   private normalizeRoomCode(code: string): string {
     return (code || '').trim().toLowerCase();
@@ -59,6 +81,19 @@ export class MeetingGateway
   // Saat user terputus, bersihkan data & beritahu HANYA anggota room yang sama
   handleDisconnect(client: Socket) {
     console.log(`Klien terputus: ${client.id}`);
+
+    // Sedang menunggu di ruang tunggu? Batalkan permintaannya di layar host
+    const pending = this.pendingJoins.get(client.id);
+    if (pending) {
+      this.pendingJoins.delete(client.id);
+      const hostId = this.roomHosts.get(pending.roomCode);
+      if (hostId) {
+        this.server
+          .to(hostId)
+          .emit('join-request-cancelled', { userId: client.id });
+      }
+    }
+
     this.removeParticipant(client.id);
   }
 
@@ -89,9 +124,42 @@ export class MeetingGateway
           hostId: remaining.id,
           hostName: remaining.name,
         });
+        // Host baru mewarisi antrean ruang tunggu yang masih menunggu
+        for (const [id, pending] of this.pendingJoins.entries()) {
+          if (pending.roomCode === roomCode) {
+            this.server.to(remaining.id).emit('join-request', {
+              userId: id,
+              userName: pending.userName,
+            });
+          }
+        }
       }
     }
+
+    // Room kosong? Bersihkan seluruh state-nya (termasuk status terkunci)
+    const stillOccupied = [...this.participants.values()].some(
+      (p) => p.roomCode === roomCode,
+    );
+    if (!stillOccupied) {
+      this.cleanupRoom(roomCode);
+    }
+
     this.broadcastParticipants(roomCode);
+  }
+
+  // Bersihkan seluruh state sebuah room (dipanggil saat room kosong/berakhir)
+  private cleanupRoom(roomCode: string) {
+    this.roomHosts.delete(roomCode);
+    this.lockedRooms.delete(roomCode);
+    this.waitingRooms.delete(roomCode);
+    this.roomMessages.delete(roomCode);
+    // Yang masih menunggu di ruang tunggu: tolak dengan alasan room berakhir
+    for (const [id, pending] of [...this.pendingJoins.entries()]) {
+      if (pending.roomCode === roomCode) {
+        this.pendingJoins.delete(id);
+        this.server.to(id).emit('join-denied', { reason: 'room-closed' });
+      }
+    }
   }
 
   // Kirim daftar peserta terbaru ke seluruh anggota room
@@ -132,6 +200,30 @@ export class MeetingGateway
       (data.userName || '').trim().substring(0, 40) ||
       `Tamu ${client.id.substring(0, 4)}`;
 
+    // Room terkunci: tolak peserta baru (host mengunci dari panel peserta)
+    if (this.lockedRooms.has(roomCode)) {
+      client.emit('join-denied', { reason: 'locked' });
+      return;
+    }
+
+    // Ruang tunggu aktif & sudah ada host: tahan dulu, minta persetujuan host
+    if (this.waitingRooms.has(roomCode) && this.roomHosts.has(roomCode)) {
+      this.pendingJoins.set(client.id, { roomCode, userName });
+      client.emit('waiting-approval', { roomCode });
+      const hostId = this.roomHosts.get(roomCode);
+      if (hostId) {
+        this.server
+          .to(hostId)
+          .emit('join-request', { userId: client.id, userName });
+      }
+      return;
+    }
+
+    this.completeJoin(client, roomCode, userName);
+  }
+
+  // Proses join sesungguhnya (dipanggil langsung, atau setelah host mengizinkan)
+  private completeJoin(client: Socket, roomCode: string, userName: string) {
     void client.join(roomCode);
 
     // Orang pertama yang masuk room menjadi host
@@ -162,6 +254,12 @@ export class MeetingGateway
       hostId: this.roomHosts.get(roomCode),
       roomCode,
     });
+
+    // Kirim riwayat chat agar peserta baru ikut melihat percakapan sebelumnya
+    const history = this.roomMessages.get(roomCode);
+    if (history && history.length > 0) {
+      client.emit('chat-history', { messages: history });
+    }
 
     // Beri tahu peserta lama bahwa ada user baru (memicu WebRTC offer). Sertakan nama.
     client.to(roomCode).emit('user-joined', { userId: client.id, userName });
@@ -222,13 +320,21 @@ export class MeetingGateway
     const text = (data.text || '').substring(0, 2000);
     if (!text.trim()) return;
 
-    this.server.to(sender.roomCode).emit('chat-message', {
+    const msg = {
       messageId: data.messageId,
       senderId: client.id,
       senderName: sender.name,
       text,
       sentAt: Date.now(),
-    });
+    };
+
+    // Simpan ke riwayat room (maks 100 pesan terakhir)
+    const history = this.roomMessages.get(sender.roomCode) ?? [];
+    history.push(msg);
+    if (history.length > 100) history.shift();
+    this.roomMessages.set(sender.roomCode, history);
+
+    this.server.to(sender.roomCode).emit('chat-message', msg);
   }
 
   // Hapus pesan chat. Pengirim boleh hapus pesannya sendiri; host boleh hapus pesan siapa pun.
@@ -242,6 +348,15 @@ export class MeetingGateway
 
     const isOwner = data.ownerId === client.id;
     if (!isOwner && !this.isHost(client)) return;
+
+    // Hapus juga dari riwayat agar peserta baru tidak melihat pesan terhapus
+    const history = this.roomMessages.get(sender.roomCode);
+    if (history) {
+      this.roomMessages.set(
+        sender.roomCode,
+        history.filter((m) => m.messageId !== data.messageId),
+      );
+    }
 
     this.server.to(sender.roomCode).emit('message-deleted', {
       messageId: data.messageId,
@@ -339,6 +454,129 @@ export class MeetingGateway
     this.server.to(sender.roomCode).except(client.id).emit('force-mute');
   }
 
+  // Validasi umum aksi host terhadap satu target di room yang sama
+  private hostTarget(
+    client: Socket,
+    targetId: string,
+  ): { host: Participant; target: Participant } | null {
+    if (!this.isHost(client)) return null;
+    const host = this.senderOf(client);
+    const target = this.participants.get(targetId);
+    if (!host || !target || target.roomCode !== host.roomCode) return null;
+    return { host, target };
+  }
+
+  // Host MEMINTA peserta menyalakan mikrofon (perlu persetujuan peserta, ala Zoom)
+  @SubscribeMessage('request-unmute')
+  handleRequestUnmute(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { targetId: string },
+  ) {
+    const pair = this.hostTarget(client, data.targetId);
+    if (!pair) return;
+    this.server
+      .to(data.targetId)
+      .emit('unmute-requested', { hostName: pair.host.name });
+  }
+
+  // Host mematikan kamera seorang peserta (langsung, tanpa persetujuan)
+  @SubscribeMessage('camera-off-participant')
+  handleCameraOffParticipant(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { targetId: string },
+  ) {
+    const pair = this.hostTarget(client, data.targetId);
+    if (!pair) return;
+    this.server.to(data.targetId).emit('force-camera-off');
+  }
+
+  // Host MEMINTA peserta menyalakan kamera (perlu persetujuan peserta)
+  @SubscribeMessage('request-camera-on')
+  handleRequestCameraOn(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { targetId: string },
+  ) {
+    const pair = this.hostTarget(client, data.targetId);
+    if (!pair) return;
+    this.server
+      .to(data.targetId)
+      .emit('camera-on-requested', { hostName: pair.host.name });
+  }
+
+  // Host mengaktifkan/mematikan ruang tunggu
+  @SubscribeMessage('toggle-waiting-room')
+  handleToggleWaitingRoom(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { enabled: boolean },
+  ) {
+    if (!this.isHost(client)) return;
+    const sender = this.senderOf(client);
+    if (!sender) return;
+    if (data.enabled) this.waitingRooms.add(sender.roomCode);
+    else this.waitingRooms.delete(sender.roomCode);
+    this.server.to(sender.roomCode).emit('waiting-room-changed', {
+      enabled: !!data.enabled,
+      byName: sender.name,
+    });
+    // Ruang tunggu dimatikan: langsung masukkan semua yang sedang menunggu
+    if (!data.enabled) {
+      for (const [id, pending] of [...this.pendingJoins.entries()]) {
+        if (pending.roomCode !== sender.roomCode) continue;
+        const sock = this.server.sockets.sockets.get(id);
+        this.pendingJoins.delete(id);
+        if (sock) this.completeJoin(sock, pending.roomCode, pending.userName);
+      }
+    }
+  }
+
+  // Host mengizinkan peserta yang menunggu untuk masuk
+  @SubscribeMessage('admit-participant')
+  handleAdmitParticipant(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { targetId: string },
+  ) {
+    if (!this.isHost(client)) return;
+    const host = this.senderOf(client);
+    const pending = this.pendingJoins.get(data.targetId);
+    if (!host || !pending || pending.roomCode !== host.roomCode) return;
+
+    const sock = this.server.sockets.sockets.get(data.targetId);
+    this.pendingJoins.delete(data.targetId);
+    if (sock) this.completeJoin(sock, pending.roomCode, pending.userName);
+  }
+
+  // Host menolak peserta yang menunggu
+  @SubscribeMessage('deny-participant')
+  handleDenyParticipant(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { targetId: string },
+  ) {
+    if (!this.isHost(client)) return;
+    const host = this.senderOf(client);
+    const pending = this.pendingJoins.get(data.targetId);
+    if (!host || !pending || pending.roomCode !== host.roomCode) return;
+
+    this.pendingJoins.delete(data.targetId);
+    this.server.to(data.targetId).emit('join-denied', { reason: 'denied' });
+  }
+
+  // Host mengunci/membuka room: saat terkunci, peserta baru ditolak
+  @SubscribeMessage('lock-meeting')
+  handleLockMeeting(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { locked: boolean },
+  ) {
+    if (!this.isHost(client)) return;
+    const sender = this.senderOf(client);
+    if (!sender) return;
+    if (data.locked) this.lockedRooms.add(sender.roomCode);
+    else this.lockedRooms.delete(sender.roomCode);
+    this.server.to(sender.roomCode).emit('meeting-locked', {
+      locked: !!data.locked,
+      byName: sender.name,
+    });
+  }
+
   // Host mengeluarkan seorang peserta dari room
   @SubscribeMessage('kick-participant')
   handleKickParticipant(
@@ -379,6 +617,6 @@ export class MeetingGateway
         this.participants.delete(id);
       }
     }
-    this.roomHosts.delete(roomCode);
+    this.cleanupRoom(roomCode);
   }
 }

@@ -10,9 +10,9 @@ import { MeetingGateway } from './meeting/meeting.gateway'; // 1. Import gateway
   imports: [],
   controllers: [AppController, MeetingController],
   providers: [
-    AppService, 
-    MeetingService, 
-    MeetingGateway // 2. Daftarkan di sini agar server WebSocket aktif saat NestJS running
+    AppService,
+    MeetingService,
+    MeetingGateway, // 2. Daftarkan di sini agar server WebSocket aktif saat NestJS running
   ],
 })
 export class AppModule {}

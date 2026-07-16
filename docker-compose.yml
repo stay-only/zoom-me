@@ -1,0 +1,11 @@
+services:
+  meet:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      # Opsional: TURN/STUN server sendiri (JSON array, format RTCIceServer).
+      # Sangat disarankan untuk production agar video lintas jaringan andal:
+      # - ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:turn.contoh.com:3478","username":"user","credential":"rahasia"}]
+    restart: unless-stopped

@@ -1,0 +1,17 @@
+{
+  "name": "zoom-me",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aplikasi video meeting (ala Google Meet/Zoom) — NestJS + React + WebRTC, satu port production",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "setup": "npm install --prefix backend && npm install --prefix frontend",
+    "build": "npm run build --prefix frontend && npm run build --prefix backend",
+    "start": "node backend/dist/main.js",
+    "dev:backend": "npm run start:dev --prefix backend",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "lint": "npm run lint --prefix backend && npm run lint --prefix frontend"
+  }
+}

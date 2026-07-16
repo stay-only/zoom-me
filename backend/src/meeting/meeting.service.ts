@@ -43,14 +43,21 @@ export class MeetingService {
     return { id, code };
   }
 
-  joinMeeting(meetingCode: string, userId: string): { success: boolean; message: string; meetingId?: string } {
+  joinMeeting(
+    meetingCode: string,
+    userId: string,
+  ): { success: boolean; message: string; meetingId?: string } {
     for (const [id, meeting] of this.meetings.entries()) {
       if (meeting.code === meetingCode) {
         if (meeting.status === 'active') {
           if (!meeting.participants.includes(userId)) {
             meeting.participants.push(userId);
           }
-          return { success: true, message: 'Berhasil bergabung dengan rapat', meetingId: id };
+          return {
+            success: true,
+            message: 'Berhasil bergabung dengan rapat',
+            meetingId: id,
+          };
         } else {
           return { success: false, message: 'Rapat telah berakhir' };
         }
